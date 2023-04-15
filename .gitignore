@@ -1,2 +1,4 @@
 /target
 diswidgets
+**/config.yaml
+**/config.yaml.sample

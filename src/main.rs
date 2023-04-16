@@ -1,7 +1,5 @@
-use std::{time::Duration, num::NonZeroU64};
-
 use log::{info, error};
-use poise::serenity_prelude::{FullEvent, GuildId, OnlineStatus};
+use poise::serenity_prelude::FullEvent;
 
 use crate::cache::CacheHttpImpl;
 
@@ -12,6 +10,7 @@ mod config;
 mod help;
 mod stats;
 mod models;
+mod gis;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
@@ -77,9 +76,9 @@ async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
 
 async fn event_listener(event: &FullEvent, user_data: &Data) -> Result<(), Error> {
     let db: mongodb::Database = user_data.mongo.database("diswidgets");
-    let scol = db.collection::<Document>("servers");
-    let ucol = db.collection::<Document>("server_user");
-    let ccol = db.collection::<Document>("server_channel");
+    let scol = db.collection::<Document>("bot__server_info");
+    let ucol = db.collection::<Document>("bot__server_user");
+    let ccol = db.collection::<Document>("bot__server_channel");
 
     match event {
         FullEvent::InteractionCreate {
@@ -106,16 +105,11 @@ async fn event_listener(event: &FullEvent, user_data: &Data) -> Result<(), Error
                 },
             };
 
-            let user = new_data.user.to_user().ok_or_else(|| {
-                error!("Presence update without user: uid={}", new_data.user.id);
-                "Presence update without user"
-            })?;
-
             // Try to find guild in either cache or http
             let (
                 name,
                 icon,
-                member_count
+                member_count,
             ) = {
                 let g = guild_id.to_guild_cached(&ctx).ok_or_else(|| {
                 error!("Presence update without guild: gid={}", guild_id);
@@ -135,7 +129,7 @@ async fn event_listener(event: &FullEvent, user_data: &Data) -> Result<(), Error
                 (
                     g.name.clone(), 
                     g.icon_url().unwrap_or("https://cdn.discordapp.com/embed/avatars/0.png".to_string()),
-                    member_count
+                    member_count,
                 )
             };
 
@@ -154,37 +148,39 @@ async fn event_listener(event: &FullEvent, user_data: &Data) -> Result<(), Error
                 info!("Server not found in mongo, creating new entry");
                 let document = guild_doc.as_document().ok_or("Failed to convert to document")?;        
                 scol.insert_one(document, None).await?;
+
+                // Get all precenses in guild
+                let adds = {
+                    let guild = guild_id.to_guild_cached(&ctx).ok_or("Failed to get guild")?;
+
+                    let mut adds = vec![];
+
+                    for (_, precense) in guild.presences.iter() {
+                        adds.push(gis::add_user_precense(guild_id, precense)?);
+                    }
+
+                    adds
+                };
+
+                // Add all precenses to mongo
+                for add in adds {
+                    gis::add_or_update(
+                        &ucol, 
+                        &new_data.user.id.to_string(),
+                        &guild_id.to_string(), 
+                        add
+                    ).await?;
+                }
             } else {
                 info!("Server found in mongo, updating guild");
                 scol.update_one(doc! {"id": guild_id.to_string()}, doc! {"$set": guild_doc}, None).await?;
-            }
 
-            let user_doc = bson::to_bson(&models::User {
-                id: user.id.to_string(),
-                guild_id: guild_id.to_string(),
-                name: user.name.clone(),
-                discriminator: format!("{:.04}", user.discriminator),
-                avatar: user.avatar_url().unwrap_or("https://cdn.discordapp.com/embed/avatars/0.png".to_string()),
-                status: match new_data.status {
-                    OnlineStatus::Online => "online",
-                    OnlineStatus::Idle => "idle",
-                    OnlineStatus::DoNotDisturb => "dnd",
-                    OnlineStatus::Offline => "offline",
-                    OnlineStatus::Invisible => "invisible",
-                    _ => "unknown"
-                }.to_string()
-            })?;
-
-            // Check for user in mongo
-            let user_check = ucol.find_one(doc! {"id": user.id.to_string()}, None).await?;
-
-            if user_check.is_none() {
-                info!("User not found in mongo, creating new entry");
-                let document = user_doc.as_document().ok_or("Failed to convert to document")?;        
-                ucol.insert_one(document, None).await?;
-            } else {
-                info!("User found in mongo, updating user");
-                ucol.update_one(doc! {"id": user.id.to_string(), "guild_id": guild_id.to_string()}, doc! {"$set": user_doc}, None).await?;
+                gis::add_or_update(
+                &ucol, 
+                    &new_data.user.id.to_string(), 
+                    &guild_id.to_string(), 
+                    gis::add_user_precense(guild_id, new_data)?
+                ).await?;
             }
         },
         _ => {}

@@ -1,7 +1,6 @@
 use once_cell::sync::Lazy;
-use poise::serenity_prelude::GuildId;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Write, num::NonZeroU64};
+use std::{fs::File, io::Write};
 
 use crate::Error;
 

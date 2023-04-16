@@ -11,7 +11,7 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| Config::load().expect("Failed to 
 pub struct Config {
     pub mongodb_url: String,
     pub token: String,
-    pub proxy_url: String
+    pub proxy_url: String,
 }
 
 impl Default for Config {

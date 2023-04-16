@@ -1,13 +1,13 @@
 use poise::serenity_prelude::ChannelType;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Server {   
+pub struct Server {
     /// Server ID
     pub id: String,
     pub name: String,
     pub icon: String,
-    pub member_count: u64
+    pub member_count: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

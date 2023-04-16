@@ -1,16 +1,20 @@
-use log::{info, error};
+use log::{error, info};
 use poise::serenity_prelude::FullEvent;
 
 use crate::cache::CacheHttpImpl;
 
-use mongodb::{Client, options::ClientOptions, bson::{Document, doc, self}};
+use mongodb::{
+    bson::{doc, Document},
+    options::ClientOptions,
+    Client,
+};
 
 mod cache;
 mod config;
-mod help;
-mod stats;
-mod models;
 mod gis;
+mod help;
+mod models;
+mod stats;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
@@ -18,7 +22,7 @@ type Context<'a> = poise::Context<'a, Data, Error>;
 // User data, which is stored and accessible in all command invocations
 pub struct Data {
     cache_http: cache::CacheHttpImpl,
-    mongo: Client
+    mongo: Client,
 }
 
 #[poise::command(prefix_command)]
@@ -54,12 +58,7 @@ async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
             );
             if let Some(error) = error {
                 error!("Error in command `{}`: {:?}", ctx.command().name, error,);
-                let err = ctx
-                    .say(format!(
-                        "**{}**",
-                        error
-                    ))
-                    .await;
+                let err = ctx.say(format!("**{}**", error)).await;
 
                 if let Err(e) = err {
                     error!("Error while sending error message: {}", e);
@@ -86,77 +85,47 @@ async fn event_listener(event: &FullEvent, user_data: &Data) -> Result<(), Error
             ctx: _,
         } => {
             info!("Interaction received: {:?}", interaction.id());
-        },
+        }
         FullEvent::Ready {
             data_about_bot,
             ctx: _,
         } => {
-            info!(
-                "{} is ready!",
-                data_about_bot.user.name
-            );
-        },
+            info!("{} is ready!", data_about_bot.user.name);
+        }
         FullEvent::PresenceUpdate { ctx, new_data } => {
             let guild_id = match new_data.guild_id {
                 Some(guild_id) => guild_id,
                 None => {
                     info!("Presence update without guild id: uid={}", new_data.user.id);
-                    return Ok(())
-                },
+                    return Ok(());
+                }
             };
 
-            // Try to find guild in either cache or http
-            let (
-                name,
-                icon,
-                member_count,
-            ) = {
-                let g = guild_id.to_guild_cached(&ctx).ok_or_else(|| {
-                error!("Presence update without guild: gid={}", guild_id);
-                "Presence update without guild"
-                })?;
+            let inserted = gis::add_or_update(
+                &scol,
+                doc! {"id": guild_id.to_string()},
+                gis::guild(&user_data.cache_http, guild_id)?,
+            )
+            .await?;
 
-                let member_count = {
-                    if g.member_count > 0 {
-                        g.member_count
-                    } else if !g.members.is_empty() {
-                        g.members.len() as u64
-                    } else {
-                        g.approximate_member_count.unwrap_or(0)
-                    }
-                };
-
-                (
-                    g.name.clone(), 
-                    g.icon_url().unwrap_or("https://cdn.discordapp.com/embed/avatars/0.png".to_string()),
-                    member_count,
-                )
-            };
-
-
-            let guild_doc = bson::to_bson(&models::Server {
-                id: guild_id.to_string(),
-                name,
-                icon,
-                member_count
-            })?;
-
-            // Check for server in mongo
-            let guild_check = scol.find_one(doc! {"id": guild_id.to_string()}, None).await?;
-
-            if guild_check.is_none() {
-                info!("Server not found in mongo, creating new entry");
-                let document = guild_doc.as_document().ok_or("Failed to convert to document")?;        
-                scol.insert_one(document, None).await?;
-
+            if inserted {
+                info!(
+                    "Inserted new guild, adding current precenses: {}",
+                    guild_id.to_string()
+                );
                 // Get all precenses in guild
                 let adds = {
-                    let guild = guild_id.to_guild_cached(&ctx).ok_or("Failed to get guild")?;
+                    let guild = guild_id
+                        .to_guild_cached(&ctx)
+                        .ok_or("Failed to get guild")?;
 
                     let mut adds = vec![];
 
                     for (_, precense) in guild.presences.iter() {
-                        adds.push(gis::add_user_precense(guild_id, precense)?);
+                        match gis::user_precense(guild_id, precense) {
+                            Ok(bson) => adds.push(bson),
+                            Err(e) => error!("Failed to create bson document for precense: {}", e),
+                        }
                     }
 
                     adds
@@ -165,24 +134,25 @@ async fn event_listener(event: &FullEvent, user_data: &Data) -> Result<(), Error
                 // Add all precenses to mongo
                 for add in adds {
                     gis::add_or_update(
-                        &ucol, 
-                        &new_data.user.id.to_string(),
-                        &guild_id.to_string(), 
+                        &ucol,
+                        doc! {"id": &new_data.user.id.to_string(), "guild_id": &guild_id.to_string()},
                         add
                     ).await?;
                 }
             } else {
-                info!("Server found in mongo, updating guild");
-                scol.update_one(doc! {"id": guild_id.to_string()}, doc! {"$set": guild_doc}, None).await?;
-
+                info!(
+                    "Adding new precense: gid={}, uid={}",
+                    guild_id.to_string(),
+                    new_data.user.id.to_string()
+                );
                 gis::add_or_update(
-                &ucol, 
-                    &new_data.user.id.to_string(), 
-                    &guild_id.to_string(), 
-                    gis::add_user_precense(guild_id, new_data)?
-                ).await?;
+                    &ucol,
+                    doc! {"id": &new_data.user.id.to_string(), "guild_id":  &guild_id.to_string()},
+                    gis::user_precense(guild_id, new_data)?,
+                )
+                .await?;
             }
-        },
+        }
         _ => {}
     }
 
@@ -204,11 +174,10 @@ async fn main() {
         .ratelimiter_disabled(true)
         .build();
 
-    let client_builder =
-        serenity::all::ClientBuilder::new_with_http(
-            http, 
-            serenity::all::GatewayIntents::all() // TODO: Set intents properly
-        );
+    let client_builder = serenity::all::ClientBuilder::new_with_http(
+        http,
+        serenity::all::GatewayIntents::all(), // TODO: Set intents properly
+    );
 
     let framework = poise::Framework::new(
         poise::FrameworkOptions {
@@ -218,12 +187,7 @@ async fn main() {
                 ..poise::PrefixFrameworkOptions::default()
             },
             listener: |event, _ctx, user_data| Box::pin(event_listener(event, user_data)),
-            commands: vec![
-                register(),
-                help::help(),
-                help::simplehelp(),
-                stats::stats(),
-            ],
+            commands: vec![register(), help::help(), help::simplehelp(), stats::stats()],
             /// This code is run before every command
             pre_command: |ctx| {
                 Box::pin(async move {
@@ -251,14 +215,17 @@ async fn main() {
         },
         move |ctx, _ready, _framework| {
             Box::pin(async move {
-                let client_options = ClientOptions::parse(config::CONFIG.mongodb_url.clone()).await.expect("Error parsing MongoDB URL");
+                let client_options = ClientOptions::parse(config::CONFIG.mongodb_url.clone())
+                    .await
+                    .expect("Error parsing MongoDB URL");
 
                 Ok(Data {
                     cache_http: CacheHttpImpl {
                         cache: ctx.cache.clone(),
                         http: ctx.http.clone(),
-                    },                    
-                    mongo: Client::with_options(client_options).expect("Error creating MongoDB client")
+                    },
+                    mongo: Client::with_options(client_options)
+                        .expect("Error creating MongoDB client"),
                 })
             })
         },
